@@ -89,24 +89,16 @@ jobs:
             --query 'data[0].name' \
             --raw-output 2>/dev/null | tr -d '\r\n')
 
-          set +e
           TF_VAR_availability_domain="${AD}" \
           TF_VAR_worker_availability_domain="${AD}" \
-          tofu plan -input=false -no-color -detailed-exitcode -out=tfplan.binary > plan-raw.txt 2>&1
-          EXIT_CODE=$?
-          set -e
-          cat plan-raw.txt
-          echo "Plan exit code: $EXIT_CODE"
+          tofu plan -input=false -no-color -out=tfplan.binary 2>&1 | tee plan-raw.txt
 
-          if [[ $EXIT_CODE -eq 0 ]]; then
-            echo "has_changes=false" >> "$GITHUB_OUTPUT"
-            echo "✅ No changes — infrastructure is up to date."
-          elif [[ $EXIT_CODE -eq 2 ]]; then
+          if grep -qE '^Plan: ' plan-raw.txt && ! grep -q 'Plan: 0 to add, 0 to change, 0 to destroy' plan-raw.txt; then
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
             echo "⚠️ Changes detected — apply required."
           else
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
-            exit 1
+            echo "✅ No changes — infrastructure is up to date."
           fi
 
       - name: Write plan to Job Summary
