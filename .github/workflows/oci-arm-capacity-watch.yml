@@ -1,0 +1,132 @@
+name: OCI ARM Capacity Watch
+
+# Runs every 5 minutes from this PUBLIC repo (free unlimited Actions minutes).
+# Checks out the PRIVATE valuepenny repo's Terraform code and attempts tofu apply.
+on:
+  schedule:
+    - cron: "*/5 * * * *"    # every 5 minutes, 24/7
+  workflow_dispatch:          # manual trigger for testing
+
+env:
+  TF_VERSION: "1.9.0"
+  WORKING_DIR: infra/opentofu
+
+  TF_VAR_tenancy_ocid:        ${{ secrets.OCI_TENANCY_OCID }}
+  TF_VAR_user_ocid:           ${{ secrets.OCI_USER_OCID }}
+  TF_VAR_fingerprint:         ${{ secrets.OCI_FINGERPRINT }}
+  TF_VAR_private_key:         ${{ secrets.OCI_PRIVATE_KEY }}
+  TF_VAR_region:              ${{ vars.OCI_REGION }}
+  TF_VAR_compartment_id:      ${{ secrets.OCI_COMPARTMENT_ID }}
+  TF_VAR_ssh_public_key:      ${{ secrets.VM_SSH_PUBLIC_KEY }}
+
+  AWS_ACCESS_KEY_ID:     ${{ secrets.OCI_STATE_ACCESS_KEY }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.OCI_STATE_SECRET_KEY }}
+
+jobs:
+  try-create:
+    name: Try ARM instance creation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout private valuepenny repo
+        uses: actions/checkout@v4
+        with:
+          repository: csscientist/valuepenny
+          ref: amazon
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+
+      - uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: ${{ env.TF_VERSION }}
+
+      - name: Install OCI CLI
+        run: |
+          curl -sL https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh | \
+            bash -s -- --accept-all-defaults
+          echo "$HOME/bin" >> $GITHUB_PATH
+
+      - name: Configure OCI CLI
+        env:
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+          OCI_REGION: ${{ vars.OCI_REGION }}
+        run: |
+          mkdir -p ~/.oci
+          printf '%s' "${OCI_PRIVATE_KEY}" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${OCI_USER_OCID}
+          fingerprint=${OCI_FINGERPRINT}
+          tenancy=${OCI_TENANCY_OCID}
+          region=${OCI_REGION}
+          key_file=~/.oci/oci_api_key.pem
+          EOF
+          chmod 600 ~/.oci/config
+
+      - name: tofu init
+        working-directory: ${{ env.WORKING_DIR }}
+        run: tofu init -input=false -upgrade
+
+      - name: Try apply across all ADs
+        id: apply
+        working-directory: ${{ env.WORKING_DIR }}
+        env:
+          OCI_COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
+          OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+          SUPPRESS_LABEL_WARNING: "True"
+        run: |
+          # Get all availability domains
+          ADS=$(oci iam availability-domain list \
+            --compartment-id "${OCI_COMPARTMENT_ID}" \
+            --query 'data[].name' \
+            --raw-output 2>/dev/null | tr -d '[]",' | tr ' ' '\n' | grep -v '^$')
+
+          echo "ADs to try: ${ADS}"
+          SUCCEEDED="false"
+
+          for AD in ${ADS}; do
+            AD=$(printf '%s' "${AD}" | tr -d '\r\n ')
+            echo "============================================"
+            echo "Trying AD: ${AD}"
+            echo "============================================"
+
+            if TF_VAR_availability_domain="${AD}" \
+               TF_VAR_worker_availability_domain="${AD}" \
+               tofu apply -input=false -auto-approve 2>&1; then
+              echo "✅ Apply succeeded in AD: ${AD}!"
+              SUCCEEDED="true"
+              echo "succeeded=true" >> "$GITHUB_OUTPUT"
+              echo "ad=${AD}" >> "$GITHUB_OUTPUT"
+              break
+            else
+              echo "❌ Failed in AD: ${AD} — trying next..."
+            fi
+          done
+
+          if [[ "${SUCCEEDED}" != "true" ]]; then
+            echo "❌ No capacity in any AD this round."
+            echo "succeeded=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+      - name: Show outputs on success
+        if: steps.apply.outputs.succeeded == 'true'
+        working-directory: ${{ env.WORKING_DIR }}
+        run: |
+          echo "## 🎉 ARM Instances Created!" >> $GITHUB_STEP_SUMMARY
+          echo "Availability Domain: \`${{ steps.apply.outputs.ad }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          tofu output 2>/dev/null >> $GITHUB_STEP_SUMMARY || echo "Outputs not available" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ **Disable this cron workflow now** — instances are created." >> $GITHUB_STEP_SUMMARY
+
+      - name: Summary (no capacity)
+        if: steps.apply.outputs.succeeded != 'true'
+        run: |
+          echo "## ⏳ No ARM Capacity" >> $GITHUB_STEP_SUMMARY
+          echo "Tried all ADs — will retry in 5 minutes." >> $GITHUB_STEP_SUMMARY
