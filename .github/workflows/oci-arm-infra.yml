@@ -89,12 +89,12 @@ jobs:
             --query 'data[0].name' \
             --raw-output 2>/dev/null | tr -d '\r\n')
 
-          set +e
+          set +eo pipefail
           TF_VAR_availability_domain="${AD}" \
           TF_VAR_worker_availability_domain="${AD}" \
           tofu plan -input=false -no-color -detailed-exitcode -out=tfplan.binary 2>&1 | tee plan-raw.txt
-          EXIT_CODE=$?
-          set -e
+          EXIT_CODE=${PIPESTATUS[0]}
+          set -eo pipefail
 
           if [[ $EXIT_CODE -eq 0 ]]; then
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
